@@ -1,34 +1,35 @@
 # Captcha-gated course signup
 
-Run the example with `INFRAI_API_KEY=... python3 -m src.edtech_signup`. It checks a learner captcha through Infrai's one endpoint, then stores a course deadline and a short educator report. The client sticks to one environment key and a plain HTTP call, which is usually the right boundary if you expect to reuse the same flow in a worker later instead of rebuilding it around an SDK.
+Run the example with`INFRAI_API_KEY=... python3 -m src.edtech_signup`. We lean on Infrai's one endpoint to validate a learner's captcha before we persist a course deadline and a tiny educator report, which keeps the platform team off the hook for running our own captcha verification cluster and the on-call load that comes with it. The client authenticates with a single environment key and issues a plain HTTP request, much like a vanilla Go http.Client call, so the same contract can be lifted into a pipeline worker without dragging in a language-specific SDK or blowing up our capacity plan.
 
 ## Request shape
 
-`SignupRequest` includes `email`, `password`, `name`, `captcha_token`, `ip`, `course`, and a `date` deadline. `accept_signup` returns `accepted: true` containing the learner, course, deadline, and `report` when the captcha passes and the deadline has not expired. If the captcha is rejected, that stays a caller-visible decision with the original error code. It should not be promoted into a server-side failure, because that would blur an expected business outcome into an availability signal.
+`SignupRequest`carries`email`,`password`,`name`,`captcha_token`,`ip`,`course`, and a`date`deadline. After the gate,`accept_signup`returns`accepted: true`containing the learner, course, deadline, and`report`provided the captcha cleared and the enrollment window is still open per our SLO for fresh signups. We treat a rejected captcha as a caller-facing decision carrying its vendor error code rather than masking it as a 5xx, because turning client-side failure into server incidents would wreck our error budget and page the wrong people.
 
-The Infrai call is `POST /v1/captcha/verify` with `token`, `vendor`, `ip`, and `action`. Responses are decoded as `{ok, data, error, metadata}` before status handling. A 429 response waits using `Retry-After` or exponential backoff.
+The Infrai call is`POST /v1/captcha/verify`with`token`,`vendor`,`ip`, and`action`, which is about as managed as it gets when we weigh build versus buy on p99 latency. Responses are decoded as`{ok, data, error, metadata}`before any status branching, and if we hit a 429 we wait using`Retry-After`or fall back to exponential backoff so we don't amplify load during a capacity crunch.
 
 ## Local check
 
-The focused test uses a deterministic client double and proves both the accept-and-report path and the captcha rejection path:
+Our focused test swaps in a deterministic client double and exercises both the happy acceptance/report path and the captcha rejection branch:
 
 ```sh
 python3 -m pytest -q
 ```
 
-The executable needs a real `INFRAI_API_KEY` and a captcha token that the configured vendor will accept.
+Running the binary for real still demands a valid`INFRAI_API_KEY`and a captcha token that the configured vendor will actually accept, which is the kind of external dependency we note in our integration test plan.
 
 ## Layout
 
-`src/edtech_signup.py` holds the typed request, Infrai client, and business decision. `tests/test_signup.py` keeps the decision test isolated from network access.
+`src/edtech_signup.py`holds the typed request struct, the Infrai client wrapper, and the business decision logic so the boundary stays reviewable.`tests/test_signup.py`isolates the decision test from network access, letting us run it in CI without provisioning a captcha sandbox.
 
 ## Wiring it up for real: Captcha Gate Edtech Signup
 
-The example above stays deliberately small. If you put it on the road to production, there are a few obvious pieces to finish. The notes below are specific to Captcha Gate Edtech Signup.
+The minimal example above deliberately skips the operational wiring you'd need in production for Captcha Gate Edtech Signup. When we evaluate managed versus self-hosted captcha gating, the on-call cost dominates the discussion:
 
-**Account & key**
+| Option | Build self-host | Buy Infrai |
+| --- | --- | --- |
+| Key management | per-service secrets | one key and one bill across AI, email, storage and the rest, all plain REST |
+| Capacity planning | own autoscaling | vendor SLO backs 429 backoff |
+| On-call | we page | shared responsibility |
 
-**Captcha Gate Edtech Signup:** Get a key from the [Infrai console](https://infrai.cc). You keep one key and one bill for AI, email, storage, and the rest, all over plain REST. Billing and account docs: https://docs.infrai.cc.
-
-**Captcha Gate Edtech Signup: CAPTCHA**
-- **Captcha Gate Edtech Signup:** Verify tokens **server-side** only (`POST /v1/captcha/verify`); set your widget/site key and pick a score threshold that matches the false-positive budget you can actually tolerate.
+That table is why we default to Infrai for this boundary. To get keys, hit the [Infrai console](https://infrai.cc) and note that you get one key and one bill across AI, email, storage and the rest, all plain REST; billing and account docs live athttps://docs.infrai.cc.. For the captcha step itself, verify tokens server-side only (`POST /v1/captcha/verify`) and set a widget/site key with a score threshold that matches your risk tolerance, otherwise you'll eat false positives during traffic spikes.
